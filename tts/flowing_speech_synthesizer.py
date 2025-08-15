@@ -6,19 +6,20 @@ import base64
 import time
 import json
 import threading
-from websocket import ABNF, WebSocketApp
+import websocket
 import uuid
 import urllib
 from common.log import logger
+from common.utils import is_python3
 
 
 _PROTOCOL = "wss://"
 _HOST = "tts.cloud.tencent.com"
-_PATH = "/stream_ws"
-_ACTION = "TextToStreamAudioWS"
+_PATH = "/stream_wsv2"
+_ACTION = "TextToStreamAudioWSv2"
 
 
-class SpeechSynthesisListener(object):
+class FlowingSpeechSynthesisListener(object):
     '''
     '''
     def on_synthesis_start(self, session_id):
@@ -54,8 +55,12 @@ FINAL = 3
 ERROR = 4
 CLOSED = 5
 
+FlowingSpeechSynthesizer_ACTION_SYNTHESIS = "ACTION_SYNTHESIS"
+FlowingSpeechSynthesizer_ACTION_COMPLETE = "ACTION_COMPLETE"
+FlowingSpeechSynthesizer_ACTION_RESET = "ACTION_RESET"
 
-class SpeechSynthesizer:
+
+class FlowingSpeechSynthesizer:
 
     def __init__(self, appid, credential, listener):
         self.appid = appid
@@ -65,18 +70,26 @@ class SpeechSynthesizer:
         self.wst = None
         self.listener = listener
 
-        self.text = "欢迎使用腾讯云实时语音合成"
+        self.ready = False
+
         self.voice_type = 0
         self.codec = "pcm"
         self.sample_rate = 16000
-        self.volume = 0
+        self.volume = 10
         self.speed = 0
         self.session_id = ""
-        self.enable_subtitle = True
-        self.fast_voice_type = ""
+        self.enable_subtitle = 0
+        self.emotion_category = ""
+        self.emotion_intensity = 100
 
     def set_voice_type(self, voice_type):
         self.voice_type = voice_type
+
+    def set_emotion_category(self, emotion_category):
+        self.emotion_category = emotion_category
+
+    def set_emotion_intensity(self, emotion_intensity):
+        self.emotion_intensity = emotion_intensity
 
     def set_codec(self, codec):
         self.codec = codec
@@ -89,15 +102,9 @@ class SpeechSynthesizer:
 
     def set_volume(self, volume):
         self.volume = volume
-    
-    def set_text(self, text):
-        self.text = text
 
     def set_enable_subtitle(self, enable_subtitle):
         self.enable_subtitle = enable_subtitle
-
-    def set_fast_voice_type(self, fast_voice_type):
-        self.fast_voice_type = fast_voice_type
 
     def __gen_signature(self, params):
         sort_dict = sorted(params.keys())
@@ -105,8 +112,12 @@ class SpeechSynthesizer:
         for key in sort_dict:
             sign_str = sign_str + key + "=" + str(params[key]) + '&'
         sign_str = sign_str[:-1]
-        secret_key = self.credential.secret_key.encode('utf-8')
-        sign_str = sign_str.encode('utf-8')
+        print(sign_str)
+        if is_python3():
+            secret_key = self.credential.secret_key.encode('utf-8')
+            sign_str = sign_str.encode('utf-8')
+        else:
+            secret_key = self.credential.secret_key
         hmacstr = hmac.new(secret_key, sign_str, hashlib.sha1).digest()
         s = base64.b64encode(hmacstr)
         s = s.decode('utf-8')
@@ -126,10 +137,10 @@ class SpeechSynthesizer:
         params['Speed'] = self.speed
         params['Volume'] = self.volume
         params['SessionId'] = self.session_id
-        params['Text'] = self.text
         params['EnableSubtitle'] = self.enable_subtitle
-        if len(self.fast_voice_type) > 0:
-            params['FastVoiceType'] = self.fast_voice_type
+        if self.emotion_category != "":
+            params['EmotionCategory']= self.emotion_category
+            params['EmotionIntensity']= self.emotion_intensity
 
         timestamp = int(time.time())
         params['Timestamp'] = timestamp
@@ -137,8 +148,6 @@ class SpeechSynthesizer:
         return params
 
     def __create_query_string(self, param):
-        param['Text'] = urllib.parse.quote(param['Text'])
-        
         param = sorted(param.items(), key=lambda d: d[0])
 
         url = _PROTOCOL + _HOST + _PATH
@@ -154,6 +163,44 @@ class SpeechSynthesizer:
         signstr = signstr[:-1]
         return signstr
 
+    def __new_ws_request_message(self, action, data):
+        return {
+            "session_id": self.session_id,
+            "message_id": str(uuid.uuid1()),
+
+            "action": action,
+            "data": data,
+        }
+    
+    def __do_send(self, action, text):
+        WSRequestMessage = self.__new_ws_request_message(action, text)
+        data = json.dumps(WSRequestMessage)
+        opcode = websocket.ABNF.OPCODE_TEXT
+        logger.info("ws send opcode={} data={}".format(opcode, data))
+        self.ws.send(data, opcode)
+
+    def process(self, text, action=FlowingSpeechSynthesizer_ACTION_SYNTHESIS):
+        logger.info("process: action={} data={}".format(action, text))
+        self.__do_send(action, text)
+
+    def complete(self, action = FlowingSpeechSynthesizer_ACTION_COMPLETE):
+        logger.info("complete: action={}".format(action))
+        self.__do_send(action, "")
+    
+    def reset(self, action = FlowingSpeechSynthesizer_ACTION_RESET):
+        logger.info("reset: action={}".format(action))
+        self.__do_send(action, "")
+
+    def wait_ready(self, timeout_ms):
+        timeout_start = int(time.time() * 1000)
+        while True:
+            if self.ready:
+                return True
+            if int(time.time() * 1000) - timeout_start > timeout_ms:
+                break
+            time.sleep(0.01)
+        return False
+
     def start(self):
         logger.info("synthesizer start: begin")
 
@@ -164,12 +211,11 @@ class SpeechSynthesizer:
             logger.info("client has closed connection ({}), cost {} ms".format(reason, int((tb-ta)*1000)))
 
         def _on_data(ws, data, opcode, flag):
-            # NOTE print all message that client received
-            # logger.info("data={} opcode={} flag={}".format(data, opcode, flag))
-            if opcode == ABNF.OPCODE_BINARY:
+            logger.debug("data={} opcode={} flag={}".format(data, opcode, flag))
+            if opcode == websocket.ABNF.OPCODE_BINARY:
                 self.listener.on_audio_result(data) # <class 'bytes'>
                 pass
-            elif opcode == ABNF.OPCODE_TEXT:
+            elif opcode == websocket.ABNF.OPCODE_TEXT:
                 resp = json.loads(data) # WSResponseMessage
                 if resp['code'] != 0:
                     logger.error("server synthesis fail request_id={} code={} msg={}".format(
@@ -182,6 +228,16 @@ class SpeechSynthesizer:
                     self.status = FINAL
                     _close_conn("after recv final")
                     self.listener.on_synthesis_end()
+                    return
+                if "ready" in resp and resp['ready'] == 1:
+                    logger.info("recv READY frame")
+                    self.ready = True
+                    return
+                if "reset" in resp and resp['reset'] == 1:
+                    logger.info("recv RESET frame")
+                    return
+                if "heartbeat" in resp and resp['heartbeat'] == 1:
+                    logger.info("recv HEARTBEAT frame")
                     return
                 if "result" in resp:
                     if "subtitles" in resp["result"] and resp["result"]["subtitles"] is not None:
@@ -210,18 +266,22 @@ class SpeechSynthesizer:
         signature = self.__gen_signature(params)
         requrl = self.__create_query_string(params)
 
-        autho = urllib.parse.quote(signature)
+        if is_python3():
+            autho = urllib.parse.quote(signature)
+        else:
+            autho = urllib.quote(signature)
         requrl += "&Signature=%s" % autho
+        print(requrl)
 
-        self.ws = WebSocketApp(requrl, None,
+        self.ws = websocket.WebSocketApp(requrl, None,# header=headers,
             on_error=_on_error, on_close=_on_close,
             on_data=_on_data)
         self.ws.on_open = _on_open
-        
+
+        self.status = STARTED
         self.wst = threading.Thread(target=self.ws.run_forever)
         self.wst.daemon = True
         self.wst.start()
-        self.status = STARTED
         self.listener.on_synthesis_start(session_id)
         
         logger.info("synthesizer start: end")
